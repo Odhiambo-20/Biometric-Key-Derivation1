@@ -36,9 +36,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ------------------------------------------------------------------
 # CONFIG
-# ------------------------------------------------------------------
 
 VIDEO_PATH     = "/home/victor/Documents/Desktop/Embeddings/IOS.mov"
 WEIGHTS_PATH   = "/home/victor/Documents/Desktop/Adaface/adaface-onnx/weights/adaface_ir_18.onnx"
@@ -46,9 +44,8 @@ FRAMES_TO_USE  = 10
 FACE_PADDING   = 0.2
 
 
-# ------------------------------------------------------------------
+
 # ADAFACE MODEL
-# ------------------------------------------------------------------
 
 class AdaFaceModel:
     """
@@ -110,9 +107,8 @@ class AdaFaceModel:
         return emb.astype(np.float32)
 
 
-# ------------------------------------------------------------------
 # FACE DETECTOR
-# ------------------------------------------------------------------
+
 
 class FaceDetector:
     """
@@ -160,9 +156,7 @@ class FaceDetector:
         return frame[y1:y2, x1:x2]
 
 
-# ------------------------------------------------------------------
 # PHASE 1 - EXTRACT 10 EVENLY SPACED FRAMES
-# ------------------------------------------------------------------
 
 def extract_frames(video_path: str, num_frames: int) -> list:
     """
@@ -209,9 +203,7 @@ def extract_frames(video_path: str, num_frames: int) -> list:
     return frames
 
 
-# ------------------------------------------------------------------
 # PHASE 2 - DETECT FACE IN EACH FRAME
-# ------------------------------------------------------------------
 
 def detect_faces(frames: list, detector: FaceDetector) -> list:
     """
@@ -234,9 +226,7 @@ def detect_faces(frames: list, detector: FaceDetector) -> list:
     return crops
 
 
-# ------------------------------------------------------------------
 # PHASE 3 - EXTRACT EMBEDDING FROM EACH FACE CROP
-# ------------------------------------------------------------------
 
 def extract_embeddings(crops: list, model: AdaFaceModel) -> list:
     """
@@ -256,9 +246,7 @@ def extract_embeddings(crops: list, model: AdaFaceModel) -> list:
     return embeddings
 
 
-# ------------------------------------------------------------------
 # PHASE 4 - AVERAGE ALL 10 EMBEDDINGS
-# ------------------------------------------------------------------
 
 def average_embeddings(embeddings: list) -> np.ndarray:
     """
@@ -288,9 +276,7 @@ def average_embeddings(embeddings: list) -> np.ndarray:
     return avg
 
 
-# ------------------------------------------------------------------
 # PHASE 5 - L2 RENORMALIZATION
-# ------------------------------------------------------------------
 
 def l2_renormalize(vector: np.ndarray) -> np.ndarray:
     """
@@ -325,10 +311,7 @@ def l2_renormalize(vector: np.ndarray) -> np.ndarray:
 
     return renormalized
 
-
-# ------------------------------------------------------------------
 # MAIN
-# ------------------------------------------------------------------
 
 def run():
     sep = "-" * 55

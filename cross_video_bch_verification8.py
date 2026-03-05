@@ -1,0 +1,1473 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║        ADAFACE FACE EMBEDDING PIPELINE  +  BCH FUZZY COMMITMENT            ║
+║              Phase 12 — CRYPTOGRAPHIC ANALYSIS + CORRECT CONSTRUCTION      ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                                                                              ║
+║  PARAMETER SET: QUANT_BITS=4, BCH(N=255, t=28) → K=71, PAR=184             ║
+║  ─────────────────────────────────────────────────────────────────────────  ║
+║                                                                              ║
+║  All BCH parameters (K, PAR, chunks, t_total, pad) are derived at          ║
+║  runtime from BCH_T_DESIGNED and QUANT_BITS. No values are hardcoded.      ║
+║                                                                              ║
+║  Runtime-derived values (verified):                                         ║
+║    BCH(N=255, t=28)  →  PAR=184, K=71                                      ║
+║    PAYLOAD = 512 × 4 = 2048 bits                                            ║
+║    chunks  = ceil(2048 / 71) = 29                                           ║
+║    pad     = 29 × 71 − 2048  = 11 bits (zero-padded last chunk)            ║
+║    t_total = 29 × 28         = 812                                          ║
+║                                                                              ║
+║  NOTE: K=71 arises from t=28 (and t=29) for BCH(255) only.                 ║
+║  K=71 does NOT arise from t=25 (that gives K=91).                          ║
+║                                                                              ║
+║  CORRECT CONSTRUCTION (Juels–Wattenberg secure sketch):                    ║
+║                                                                              ║
+║  ENROLL:                                                                     ║
+║    SALT      = os.urandom(32)              random 256-bit salt              ║
+║    r[i]      = V1_chunk[i]                 K-bit secret                     ║
+║    cw_r[i]   = BCH_encode(r[i])            N-bit codeword                   ║
+║    helper[i] = cw_r[i] XOR (r[i]++0^PAR)  XOR sketch                      ║
+║    commit    = HMAC-SHA256(SALT, r[0]||…||r[N−1])                          ║
+║                                                                              ║
+║  VERIFY:                                                                     ║
+║    noisy[i]       = helper[i] XOR (Vx_chunk[i]++0^PAR)                     ║
+║    r_hat[i], nerr = BCH_decode(noisy[i])                                    ║
+║    if any nerr == -1  →  Gate 3 FAIL                                        ║
+║    commit_v        = HMAC-SHA256(SALT, r_hat[0]||…||r_hat[N−1])            ║
+║    Gate 3          = (all nerr ≥ 0) AND (commit_v == commit)               ║
+║                                                                              ║
+║  SECURITY MODEL:                                                             ║
+║    Gate 1 (cosine ≥ 0.75) : identity gate  — rejects different persons     ║
+║    Gate 2 (Hamming ≤ 40%) : error-rate gate — rejects unrelated templates  ║
+║    Gate 3 (BCH + HMAC)    : error correction + cryptographic commitment     ║
+║    All three must pass. BCH alone is insufficient for this dataset.         ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+import hashlib
+import hmac
+import logging
+import math
+import os
+import warnings
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+import itertools
+
+import cv2
+import numpy as np
+
+warnings.filterwarnings("ignore")
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONFIG  — only primitive knobs here; everything else derived at runtime
+# ══════════════════════════════════════════════════════════════════════════════
+
+VIDEO_PATHS = [
+    "/home/victor/Documents/Desktop/Embeddings/IOS.mov",
+    "/home/victor/Documents/Desktop/Embeddings/IOS M-No Beard .mov",
+    "/home/victor/Documents/Desktop/Embeddings/Android .mp4",
+    "/home/victor/Documents/Desktop/Embeddings/Android M-No Beard .mp4",
+    "/home/victor/Documents/Desktop/Embeddings/Android video 5.mp4",
+]
+WEIGHTS_PATH = (
+    "/home/victor/Documents/Desktop/Adaface/adaface-onnx/weights/adaface_ir_18.onnx"
+)
+OUTPUT_ROOT = "masked_frames"
+
+FRAMES_TO_USE        = 20
+CANDIDATE_MULTIPLIER = 3
+FACE_SIZE            = 112
+MASK_FRACTION        = 0.38
+
+# ── Identity gates ─────────────────────────────────────────────────────────
+COSINE_ACCEPT_THRESHOLD  = 0.75   # Gate 1: cosine similarity floor
+HAMMING_REJECT_RATE      = 0.40   # Gate 2: payload Hamming-rate ceiling
+MIN_SIMILARITY_THRESHOLD = 0.80   # Pairwise reporting threshold
+
+# ── BCH primitive parameters (ALL derived values computed in run()) ─────────
+#
+#  BCH_N          : codeword length (2^m − 1; here m=8 → N=255)
+#  BCH_T_DESIGNED : designed error-correction capability
+#  QUANT_BITS     : bits per embedding dimension
+#  EMBEDDING_DIM  : AdaFace output dimension
+#
+#  BCH(N=255, t=28) → K=71, PAR=184   (derived by build_bch_generator)
+#  PAYLOAD = EMBEDDING_DIM × QUANT_BITS = 512 × 4 = 2048 bits
+#  chunks  = ceil(2048 / 71)  = 29
+#  pad     = 29 × 71 − 2048   = 11 bits
+#  t_total = 29 × 28           = 812
+#
+BCH_N          = 255
+BCH_T_DESIGNED = 28   # → K=71, PAR=184
+QUANT_BITS     = 4    # → payload = EMBEDDING_DIM × 4 = 2048 bits
+EMBEDDING_DIM  = 512  # AdaFace IR-18 output dimension
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 1 — FACE PIPELINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def apply_mask(image: np.ndarray) -> np.ndarray:
+    img        = image.copy()
+    black_rows = int(img.shape[0] * MASK_FRACTION)
+    img[-black_rows:, :] = 0
+    return img
+
+
+def sharpness_score(gray: np.ndarray) -> float:
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+class FaceDetector:
+    def __init__(self):
+        xml = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        self.det = cv2.CascadeClassifier(xml)
+        if self.det.empty():
+            raise RuntimeError("Haar cascade XML not found.")
+        log.info("Face detector ready.")
+
+    def detect(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        gray  = cv2.equalizeHist(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        faces = self.det.detectMultiScale(
+            gray, scaleFactor=1.05, minNeighbors=6, minSize=(80, 80)
+        )
+        if len(faces) == 0:
+            return None
+        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+        if w < 80 or h < 80:
+            return None
+        fh, fw = frame.shape[:2]
+        x1 = max(0,  x - int(w * 0.10))
+        y1 = max(0,  y - int(h * 0.05))
+        x2 = min(fw, x + w + int(w * 0.10))
+        y2 = min(fh, y + h + int(h * 0.02))
+        crop = frame[y1:y2, x1:x2]
+        return crop if crop.size > 0 else None
+
+
+class AdaFaceModel:
+    def __init__(self, model_path: str):
+        import onnxruntime as ort
+        providers = (
+            ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            if "CUDAExecutionProvider" in ort.get_available_providers()
+            else ["CPUExecutionProvider"]
+        )
+        self.session     = ort.InferenceSession(model_path, providers=providers)
+        self.input_name  = self.session.get_inputs()[0].name
+        self.output_name = self.session.get_outputs()[0].name
+        log.info(f"Model loaded  |  Provider: {providers[0]}")
+
+    def get_embedding(self, face_112: np.ndarray) -> np.ndarray:
+        img = cv2.resize(face_112, (FACE_SIZE, FACE_SIZE))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = (img.astype(np.float32) / 255.0 - 0.5) / 0.5
+        img = img.transpose(2, 0, 1)[np.newaxis]
+        out = self.session.run([self.output_name], {self.input_name: img})
+        emb = out[0][0] if out[0].ndim == 2 else out[0]
+        norm = np.linalg.norm(emb)
+        if norm < 1e-10:
+            raise ValueError("Near-zero embedding norm — bad crop?")
+        return (emb / norm).astype(np.float32)
+
+
+def extract_high_quality_frames(
+    video_path: str, num_frames: int
+) -> List[Tuple[int, np.ndarray]]:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open: {video_path}")
+    total        = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps          = cap.get(cv2.CAP_PROP_FPS)
+    n_candidates = num_frames * CANDIDATE_MULTIPLIER
+    log.info(f"  {Path(video_path).name} — {total} frames @ {fps:.1f} fps")
+    log.info(f"  Scanning {n_candidates} candidates -> top {num_frames} by sharpness")
+    positions = [
+        int(round(i * (total - 1) / (n_candidates - 1)))
+        for i in range(n_candidates)
+    ]
+    candidates = []
+    for pos in positions:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            continue
+        score = sharpness_score(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        candidates.append((score, pos, frame))
+    cap.release()
+    if not candidates:
+        raise RuntimeError("No frames could be read.")
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    top = candidates[:num_frames]
+    top.sort(key=lambda x: x[1])
+    log.info(
+        f"  Sharpness (selected): {top[0][0]:.1f}..{top[-1][0]:.1f}"
+        f"  (pool max={candidates[0][0]:.1f})"
+    )
+    return [(pos, frame) for _, pos, frame in top]
+
+
+def print_embedding(embedding: np.ndarray, video_name: str):
+    print(f"\n  FINAL EMBEDDING — {video_name}  ({len(embedding)} dimensions)")
+    print("  " + "─" * 60)
+    for i in range(len(embedding)):
+        v = embedding[i]
+        print(f"  Dim {i+1:3d}: {'+' if v >= 0 else ''}{v:.8f}")
+    print("  " + "─" * 60)
+    print(f"  Embedding norm: {np.linalg.norm(embedding):.8f}")
+    print("  " + "─" * 60)
+
+
+def process_video(
+    video_path  : str,
+    video_index : int,
+    model       : AdaFaceModel,
+    detector    : FaceDetector,
+) -> Optional[Tuple[str, np.ndarray]]:
+    name       = Path(video_path).name
+    video_name = f"video_{video_index}"
+    sep        = "─" * 60
+    print(f"\n{sep}\n  VIDEO {video_index}: {name}\n{sep}")
+    frames = extract_high_quality_frames(video_path, FRAMES_TO_USE)
+    if not frames:
+        log.error("No frames extracted.")
+        return None
+    crops = []
+    for pos, frame in frames:
+        crop = detector.detect(frame)
+        if crop is not None:
+            crops.append((pos, crop))
+            log.info(f"  Frame {pos:>5}: face {crop.shape[1]}x{crop.shape[0]}px")
+        else:
+            log.warning(f"  Frame {pos:>5}: no face — skipped")
+    if not crops:
+        log.error(f"  No faces found in {name}")
+        return None
+    log.info(f"  Valid face crops: {len(crops)}/{len(frames)}")
+    embeddings  = []
+    best_area   = 0
+    best_masked = None
+    for pos, crop in crops:
+        resized = cv2.resize(
+            crop, (FACE_SIZE, FACE_SIZE), interpolation=cv2.INTER_LANCZOS4
+        )
+        masked  = apply_mask(resized)
+        emb     = model.get_embedding(masked)
+        embeddings.append(emb)
+        log.info(f"  Frame {pos:>5}: embedded  norm={np.linalg.norm(emb):.6f}")
+        area = crop.shape[0] * crop.shape[1]
+        if area > best_area:
+            best_area   = area
+            best_masked = masked
+    out_dir   = Path(OUTPUT_ROOT)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    save_path = out_dir / f"video_{video_index}_masked.jpg"
+    cv2.imwrite(str(save_path), best_masked)
+    log.info(f"  Masked photo saved -> {save_path}")
+    stack = np.stack(embeddings, axis=0)
+    avg   = np.mean(stack, axis=0).astype(np.float32)
+    norm  = float(np.linalg.norm(avg))
+    if norm < 1e-10:
+        raise ValueError("Averaged embedding norm near zero.")
+    final        = (avg / norm).astype(np.float32)
+    visible_rows = FACE_SIZE - int(FACE_SIZE * MASK_FRACTION)
+    print(f"\n  Frames extracted (high-quality) : {len(frames)}")
+    print(f"  Frames with detected face       : {len(crops)}")
+    print(f"  Mask cut line                   : row {visible_rows} of {FACE_SIZE}")
+    print(
+        f"    Visible rows  0-{visible_rows-1:<2}           : "
+        f"forehead, eyes, nose, nostrils"
+    )
+    print(
+        f"    Black   rows  {visible_rows}-{FACE_SIZE-1}           : mouth, chin"
+    )
+    print(f"  Saved photo                     : {save_path}")
+    print_embedding(final, video_name)
+    return video_name, final
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 2 — COSINE SIMILARITY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def cosine_similarity(v1: np.ndarray, v2: np.ndarray, label: str = "") -> float:
+    sim = float(np.clip(np.dot(v1, v2), -1.0, 1.0))
+    if label:
+        log.info(f"Cosine similarity [{label}] : {sim:.8f}")
+    return sim
+
+
+def compute_pairwise_similarities(
+    emb_dict: Dict[str, np.ndarray]
+) -> Dict[str, float]:
+    similarities = {}
+    print("\n" + "=" * 62)
+    print("  PAIRWISE COSINE SIMILARITY COMPARISONS")
+    print("=" * 62)
+    for v1n, v2n in itertools.combinations(emb_dict.keys(), 2):
+        e1, e2 = emb_dict[v1n], emb_dict[v2n]
+        print(
+            f"\n  {v1n} (norm={np.linalg.norm(e1):.8f}) vs "
+            f"{v2n} (norm={np.linalg.norm(e2):.8f})"
+        )
+        sim    = cosine_similarity(e1, e2, label=f"{v1n}_vs_{v2n}")
+        key    = f"{v1n}_vs_{v2n}"
+        status = "GOOD" if sim >= MIN_SIMILARITY_THRESHOLD else "LOW"
+        similarities[key] = sim
+        print(f"  {'='*42}")
+        print(f"  COSINE SIMILARITY: {sim:.8f}   {status}")
+        print(f"  {'='*42}")
+        if sim < MIN_SIMILARITY_THRESHOLD:
+            log.warning(
+                f"Similarity {sim:.4f} < threshold {MIN_SIMILARITY_THRESHOLD}"
+            )
+    return similarities
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 3 — GF(2) / GF(2^8) ARITHMETIC
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _gf2_divmod(dividend: list, divisor: list) -> list:
+    a = list(dividend); b = list(divisor); db = len(b) - 1
+    while len(a) - 1 >= db:
+        if a[0] == 1:
+            for i in range(len(b)):
+                a[i] ^= b[i]
+        a.pop(0)
+    while len(a) > 1 and a[0] == 0:
+        a.pop(0)
+    return a
+
+
+def _poly_pad(poly: list, length: int) -> list:
+    p = list(poly)
+    while len(p) < length:
+        p.insert(0, 0)
+    return p[-length:]
+
+
+def _poly_mul_gf2(a: list, b: list) -> list:
+    result = [0] * (len(a) + len(b) - 1)
+    for i, ai in enumerate(a):
+        for j, bj in enumerate(b):
+            result[i + j] ^= (ai & bj)
+    while len(result) > 1 and result[0] == 0:
+        result.pop(0)
+    return result
+
+
+def _gf256_mul(a: int, b: int, prim: int = 0x11D) -> int:
+    result = 0
+    while b:
+        if b & 1:
+            result ^= a
+        a <<= 1
+        if a & 0x100:
+            a ^= prim
+        b >>= 1
+    return result
+
+
+def _gf256_pow(base: int, exp: int) -> int:
+    r = 1
+    for _ in range(exp):
+        r = _gf256_mul(r, base)
+    return r
+
+
+def _conjugacy_class(exp: int) -> list:
+    seen = []; e = exp % 255
+    while e not in seen:
+        seen.append(e)
+        e = (e * 2) % 255
+    return seen
+
+
+def _minimal_poly(root_exp: int) -> list:
+    alpha = 2; conj = _conjugacy_class(root_exp); poly = [1]
+    for e in conj:
+        rv = _gf256_pow(alpha, e)
+        new_poly = [0] * (len(poly) + 1)
+        for i, c in enumerate(poly):
+            new_poly[i]   ^= c
+            new_poly[i+1] ^= _gf256_mul(c, rv)
+        poly = new_poly
+    return [int(c & 1) for c in poly]
+
+
+def build_bch_generator(t: int, n: int = BCH_N) -> Tuple[list, int, int]:
+    """
+    Build BCH(n, t) generator polynomial over GF(2^8).
+    Returns (g, K, PAR).
+
+    All parameters are derived from t and n — nothing is hardcoded.
+    K and PAR are computed purely from the cyclotomic cosets of GF(2^8).
+
+    Informational reference for BCH(255):
+      t=28 -> K=71, PAR=184   <- selected when BCH_T_DESIGNED=28
+      t=29 -> K=71, PAR=184
+      t=35 -> K=47, PAR=208
+    """
+    g = [1]; used = set()
+    for i in range(1, 2 * t, 2):
+        cls = frozenset(_conjugacy_class(i))
+        if cls in used:
+            continue
+        used.add(cls)
+        g = _poly_mul_gf2(g, _minimal_poly(i))
+    PAR = len(g) - 1
+    K   = n - PAR
+    return g, K, PAR
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 4 — BCH ENCODE / DECODE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def bch_encode(msg_bits: list, g: list, K: int, PAR: int) -> list:
+    assert len(msg_bits) == K, f"Expected {K} bits, got {len(msg_bits)}"
+    padded    = list(msg_bits) + [0] * PAR
+    remainder = _gf2_divmod(padded, g)
+    parity    = _poly_pad(remainder, PAR)
+    return list(msg_bits) + parity
+
+
+def bch_decode(
+    received_bits: list,
+    g: list,
+    K: int,
+    PAR: int,
+    t: int,
+    n: int = BCH_N,
+) -> Tuple[list, int]:
+    """
+    BCH decode via Berlekamp-Massey + Chien search.
+    Returns (corrected_K_bits, nerr).
+      nerr >= 0 : success (nerr errors corrected)
+      nerr = -1 : uncorrectable (errors > t)
+    """
+    assert len(received_bits) == n, \
+        f"Expected {n} bits, got {len(received_bits)}"
+
+    GF_EXP = [0] * 512; GF_LOG = [0] * 256; x = 1
+    for i in range(255):
+        GF_EXP[i] = GF_EXP[i + 255] = x
+        GF_LOG[x] = i
+        x = _gf256_mul(x, 2)
+
+    def gmul(a, b):
+        return 0 if (a == 0 or b == 0) \
+            else GF_EXP[(GF_LOG[a] + GF_LOG[b]) % 255]
+
+    def ginv(a):
+        return GF_EXP[255 - GF_LOG[a]]
+
+    # Syndrome computation
+    syndromes = []
+    for i in range(1, 2 * t + 1):
+        ai = GF_EXP[i % 255]; s = 0
+        for bit in received_bits:
+            s = gmul(s, ai) ^ bit
+        syndromes.append(s)
+
+    if all(s == 0 for s in syndromes):
+        return list(received_bits[:K]), 0
+
+    # Berlekamp-Massey
+    C = [1] + [0] * (2 * t)
+    B = [1] + [0] * (2 * t)
+    L = 0; m = 1; b = 1
+    for nn in range(2 * t):
+        d = syndromes[nn]
+        for j in range(1, L + 1):
+            if C[j] and syndromes[nn - j]:
+                d ^= gmul(C[j], syndromes[nn - j])
+        if d == 0:
+            m += 1
+        elif 2 * L <= nn:
+            T = list(C)
+            coef = gmul(d, ginv(b))
+            for j in range(m, 2 * t + 1):
+                if j - m < len(B) and B[j - m]:
+                    C[j] ^= gmul(coef, B[j - m])
+            L = nn + 1 - L; B = T; b = d; m = 1
+        else:
+            coef = gmul(d, ginv(b))
+            for j in range(m, 2 * t + 1):
+                if j - m < len(B) and B[j - m]:
+                    C[j] ^= gmul(coef, B[j - m])
+            m += 1
+
+    Lambda = C[:L + 1]
+    if L > t or L == 0:
+        return list(received_bits[:K]), -1
+
+    # Chien search
+    error_positions = []
+    for j in range(1, n + 1):
+        val = Lambda[0]
+        for k in range(1, len(Lambda)):
+            if Lambda[k]:
+                val ^= gmul(Lambda[k], GF_EXP[(j * k) % 255])
+        if val == 0:
+            p = j - 1
+            if 0 <= p < n:
+                error_positions.append(p)
+
+    if len(error_positions) != L:
+        return list(received_bits[:K]), -1
+
+    corrected = list(received_bits)
+    for p in error_positions:
+        corrected[p] ^= 1
+    return corrected[:K], len(error_positions)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 5 — QUANTISATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def embedding_to_payload(
+    emb       : np.ndarray,
+    shared_min: Optional[float] = None,
+    shared_max: Optional[float] = None,
+) -> Tuple[list, np.ndarray, float, float]:
+    """
+    Uniform scalar quantisation: QUANT_BITS bits per embedding dimension.
+    shared_min/max: use V1's scale for all videos (fixed reference frame).
+    Returns (bits, q_vec, v_min, v_max).
+    Total payload = EMBEDDING_DIM * QUANT_BITS bits.
+    """
+    levels  = 2 ** QUANT_BITS
+    max_val = levels - 1
+    v_min   = shared_min if shared_min is not None else float(emb.min())
+    v_max   = shared_max if shared_max is not None else float(emb.max())
+    q_vec   = np.clip(
+        np.round((emb - v_min) / (v_max - v_min) * max_val), 0, max_val
+    ).astype(np.int32)
+    bits = []
+    for q in q_vec:
+        for shift in range(QUANT_BITS - 1, -1, -1):
+            bits.append(int((int(q) >> shift) & 1))
+    return bits, q_vec, v_min, v_max
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 6 — BIT / BYTE HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def bits_to_bytes(bits: list) -> bytes:
+    b = list(bits)
+    while len(b) % 8 != 0:
+        b.insert(0, 0)
+    out = bytearray()
+    for i in range(0, len(b), 8):
+        byte = 0
+        for j in range(8):
+            byte = (byte << 1) | b[i + j]
+        out.append(byte)
+    return bytes(out)
+
+
+def bits_to_hex(bits: list) -> str:
+    b = list(bits)
+    while len(b) % 4 != 0:
+        b.insert(0, 0)
+    return "".join(
+        format(b[i] * 8 + b[i+1] * 4 + b[i+2] * 2 + b[i+3], "x")
+        for i in range(0, len(b), 4)
+    )
+
+
+def hmac_commit(salt: bytes, message_bits: list) -> str:
+    """
+    HMAC-SHA256 commitment with random salt.
+    salt         : 32 random bytes generated at enrollment
+    message_bits : concatenated r[0] || r[1] || … || r[N−1]
+    Returns      : 64-char hex digest
+    """
+    return hmac.new(salt, bits_to_bytes(message_bits), hashlib.sha256).hexdigest()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7 — ENROLL
+# ══════════════════════════════════════════════════════════════════════════════
+
+def bch_enroll(
+    v1_payload_bits: list,
+    g              : list,
+    K              : int,
+    PAR            : int,
+    num_chunks     : int,
+) -> Tuple[List[list], str, bytes]:
+    """
+    Enroll V1 using the Juels–Wattenberg secure sketch.
+
+    For each chunk i:
+        r[i]      = V1_chunk[i]               K-bit secret
+        cw_r[i]   = BCH_encode(r[i])          N-bit codeword
+        helper[i] = cw_r[i] XOR (r[i]++0^PAR)
+
+    SALT   = os.urandom(32)
+    commit = HMAC-SHA256(SALT, r[0]||…||r[N−1])
+
+    Returns (helper_data, commit_hex, salt).
+    """
+    salt   = os.urandom(32)
+    pad    = (num_chunks * K) - len(v1_payload_bits)
+    v1_pad = list(v1_payload_bits) + [0] * pad
+
+    helper_data = []
+    all_r_bits  = []
+
+    for i in range(num_chunks):
+        r        = v1_pad[i * K : (i + 1) * K]
+        cw_r     = bch_encode(r, g, K, PAR)
+        v1_pad_n = r + [0] * PAR          # r concatenated with PAR zeros
+        helper   = [a ^ b for a, b in zip(cw_r, v1_pad_n)]
+        helper_data.append(helper)
+        all_r_bits.extend(r)
+
+    commit = hmac_commit(salt, all_r_bits)
+
+    # Self-check: all enrolled codewords must have zero syndromes
+    ok = all(
+        all(
+            s == 0
+            for s in _gf2_divmod(
+                bch_encode(v1_pad[i * K : (i + 1) * K], g, K, PAR), g
+            )
+        )
+        for i in range(num_chunks)
+    )
+    log.info(
+        f"Enrollment — all codeword syndromes zero: {ok}  <- must be True"
+    )
+    log.info(
+        f"Enrollment — SALT: {salt.hex()[:16]}...  (32 bytes, random)"
+    )
+
+    return helper_data, commit, salt
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 8 — VERIFY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def bch_verify(
+    vx_payload_bits: list,
+    v1_payload_bits: list,
+    v1_embedding   : np.ndarray,
+    vx_embedding   : np.ndarray,
+    helper_data    : List[list],
+    commit_enroll  : str,
+    salt           : bytes,
+    g              : list,
+    K              : int,
+    PAR            : int,
+    t              : int,
+    num_chunks     : int,
+    video_label    : str,
+) -> dict:
+    """
+    Three-gate verification of Vx against enrolled V1.
+
+    Gate 1 — cosine similarity    : identity gate (PRIMARY discriminator)
+    Gate 2 — payload Hamming rate : error-rate gate (SECONDARY discriminator)
+    Gate 3 — BCH + HMAC-SHA256   : cryptographic gate
+    All three must PASS for ACCEPT.
+    """
+    sep60 = "─" * 60
+
+    # ── Gate 1: Cosine similarity ─────────────────────────────────────────────
+    cos_sim    = float(np.clip(np.dot(v1_embedding, vx_embedding), -1.0, 1.0))
+    gate1_pass = cos_sim >= COSINE_ACCEPT_THRESHOLD
+
+    print(f"  [Gate 1] Cosine similarity vs V1 : {cos_sim:.8f}")
+    print(f"           Threshold               : >= {COSINE_ACCEPT_THRESHOLD}")
+    print(
+        f"           Gate 1                  : "
+        f"{'PASS ✓' if gate1_pass else 'FAIL ✗  <- IMPOSTOR FLAGGED'}"
+    )
+    if not gate1_pass:
+        print(
+            f"           NOTE: BCH runs for diagnostics — verdict already FAIL."
+        )
+
+    # ── Gate 2: Payload Hamming rate ──────────────────────────────────────────
+    total_ham  = sum(a != b for a, b in zip(vx_payload_bits, v1_payload_bits))
+    ham_rate   = total_ham / len(v1_payload_bits)
+    gate2_pass = ham_rate <= HAMMING_REJECT_RATE
+
+    print()
+    print(
+        f"  [Gate 2] Payload Hamming distance : {total_ham} / {len(v1_payload_bits)}"
+        f"  ({ham_rate * 100:.2f}%)"
+    )
+    print(f"           Threshold               : <= {HAMMING_REJECT_RATE * 100:.0f}%")
+    print(
+        f"           Gate 2                  : "
+        f"{'PASS ✓' if gate2_pass else 'FAIL ✗  <- IMPOSTOR FLAGGED'}"
+    )
+    if not gate2_pass:
+        print(
+            f"           NOTE: BCH runs for diagnostics — verdict already FAIL."
+        )
+
+    print()
+    if gate1_pass and gate2_pass:
+        print("  Identity gates passed — proceeding to BCH error correction.")
+    else:
+        failed = []
+        if not gate1_pass:
+            failed.append(
+                f"Gate 1 (cosine {cos_sim:.4f} < {COSINE_ACCEPT_THRESHOLD})"
+            )
+        if not gate2_pass:
+            failed.append(
+                f"Gate 2 (Hamming {ham_rate*100:.2f}%"
+                f" > {HAMMING_REJECT_RATE*100:.0f}%)"
+            )
+        print(f"  Identity gate(s) FAILED: {' | '.join(failed)}")
+        print(f"  BCH runs for full diagnostics only.")
+    print()
+
+    # ── Pad to full chunk boundary ────────────────────────────────────────────
+    pad_vx = (num_chunks * K) - len(vx_payload_bits)
+    pad_v1 = (num_chunks * K) - len(v1_payload_bits)
+    vx_ext = list(vx_payload_bits) + [0] * pad_vx
+    v1_ext = list(v1_payload_bits) + [0] * pad_v1
+
+    # ── Per-chunk Hamming distances ───────────────────────────────────────────
+    per_chunk_ham = [
+        sum(v1_ext[i*K+j] != vx_ext[i*K+j] for j in range(K))
+        for i in range(num_chunks)
+    ]
+    max_chunk_ham   = max(per_chunk_ham)
+    chunks_over_t   = sum(1 for e in per_chunk_ham if e > t)
+    chunks_within_t = num_chunks - chunks_over_t
+
+    print(
+        f"  Total bit differences    : {total_ham} / {len(vx_payload_bits)}"
+        f"  ({ham_rate * 100:.2f}%)"
+    )
+    print(f"  Max errors in one chunk  : {max_chunk_ham}  (BCH limit t = {t})")
+    print(
+        f"  Chunks within  t={t}   : {chunks_within_t:>3} / {num_chunks}"
+        f"  {'<-- all chunks correctable ✓' if chunks_within_t == num_chunks else ''}"
+    )
+    print(
+        f"  Chunks exceeding t={t}  : {chunks_over_t:>3}  / {num_chunks}"
+        f"  {'<-- BCH will FAIL these chunks' if chunks_over_t > 0 else ''}"
+    )
+    print()
+    print("  Per-chunk Hamming distances:")
+    for i in range(0, num_chunks, 8):
+        row  = per_chunk_ham[i : i + 8]
+        line = "  ".join(
+            f"c{i+j:02d}:{row[j]:2d}" for j in range(len(row))
+        )
+        print(f"    {line}")
+
+    # ── BCH decode each chunk ─────────────────────────────────────────────────
+    recovered_r      = []
+    total_corr       = 0
+    bch_failed_count = 0
+    t_used           = []
+    k_used           = []
+
+    for i in range(num_chunks):
+        vx_chunk  = vx_ext[i * K : (i + 1) * K]
+        vx_pad_n  = vx_chunk + [0] * PAR
+        noisy_cw  = [a ^ b for a, b in zip(helper_data[i], vx_pad_n)]
+        k_used.append(per_chunk_ham[i])
+        r_hat, nerr = bch_decode(noisy_cw, g, K, PAR, t)
+        t_used.append(nerr)
+        if nerr >= 0:
+            total_corr += nerr
+            recovered_r.extend(r_hat)
+        else:
+            bch_failed_count += 1
+            recovered_r.extend(vx_chunk)  # wrong bits → HMAC will fail
+
+    # ── Gate 3: BCH + HMAC ────────────────────────────────────────────────────
+    commit_verify  = hmac_commit(salt, recovered_r)
+    bch_hmac_match = commit_verify == commit_enroll
+    gate3_pass     = (bch_failed_count == 0) and bch_hmac_match
+
+    remaining = sum(
+        a != b
+        for a, b in zip(recovered_r, v1_ext[:len(vx_payload_bits)])
+    )
+
+    print()
+    print(f"  BCH errors corrected     : {total_corr}")
+    print(
+        f"  Failed BCH chunks        : {bch_failed_count}"
+        f"  {'(0 = full recovery ✓)' if bch_failed_count == 0 else '(<- nonzero -> Gate 3 FAIL)'}"
+    )
+    print(
+        f"  Remaining bit errors     : {remaining}"
+        f"  {'(0 = perfect recovery ✓)' if remaining == 0 else ''}"
+    )
+    print()
+    print(f"  Commit V1 enroll (HMAC)  : {commit_enroll}")
+    print(f"  Commit {video_label:>7} result   : {commit_verify}")
+    print(f"  HMAC match               : {'YES ✓' if bch_hmac_match else 'NO ✗'}")
+    print(
+        f"  [Gate 3] BCH + HMAC      : "
+        f"{'PASS ✓' if gate3_pass else 'FAIL ✗'}"
+        f"{'  (BCH chunk failures present)' if bch_failed_count > 0 else ''}"
+    )
+
+    # ── Final verdict ─────────────────────────────────────────────────────────
+    all_gates_pass = gate1_pass and gate2_pass and gate3_pass
+
+    print()
+    if all_gates_pass:
+        verdict = "PASS  ✓  SAME PERSON — all three gates passed"
+    else:
+        reasons = []
+        if not gate1_pass:
+            reasons.append(
+                f"Gate 1 FAIL (cosine {cos_sim:.4f} < {COSINE_ACCEPT_THRESHOLD})"
+            )
+        if not gate2_pass:
+            reasons.append(
+                f"Gate 2 FAIL (Hamming {ham_rate*100:.2f}%"
+                f" > {HAMMING_REJECT_RATE*100:.0f}%)"
+            )
+        if not gate3_pass:
+            if bch_failed_count > 0:
+                reasons.append(
+                    f"Gate 3 FAIL ({bch_failed_count} BCH chunks uncorrectable, "
+                    f"errors exceeded t={t})"
+                )
+            elif not bch_hmac_match:
+                reasons.append(
+                    "Gate 3 FAIL (HMAC mismatch — BCH miscorrected to wrong codeword)"
+                )
+        if bch_hmac_match and (not gate1_pass or not gate2_pass):
+            reasons.append(
+                "WARN: BCH MISCORRECTED to genuine secret — "
+                "impostor errors within t, BCH incorrectly recovered r. "
+                "Identity gates prevented false accept."
+            )
+        verdict = "FAIL  ✗  REJECTED — " + " | ".join(reasons)
+
+    print(f"  Final Verdict            : {verdict}")
+
+    # ── Per-chunk detail ──────────────────────────────────────────────────────
+    successful_t = [v for v in t_used if v >= 0]
+    failed_t     = [i for i, v in enumerate(t_used) if v < 0]
+
+    print()
+    print("  ── PER-CHUNK t / K USAGE ──────────────────────────────────")
+    print(f"  BCH t={t}  K={K}  N={BCH_N}")
+    print()
+    print("  chunk | k_used (payload Hamming) | t_used (BCH corrected)")
+    print("  " + "─" * 55)
+    for i in range(0, num_chunks, 8):
+        k_row  = k_used[i : i + 8]
+        t_row  = t_used[i : i + 8]
+        k_line = "  ".join(
+            f"c{i+j:02d}:{k_row[j]:2d}" for j in range(len(k_row))
+        )
+        t_line = "  ".join(
+            f"c{i+j:02d}:{'FAIL' if t_row[j] < 0 else str(t_row[j]):>4}"
+            for j in range(len(t_row))
+        )
+        print(f"    k: {k_line}")
+        print(f"    t: {t_line}")
+        print()
+
+    if successful_t:
+        print(f"  t_used (successful chunks only):")
+        print(
+            f"    min  : {min(successful_t)}  "
+            f"(chunk {t_used.index(min(successful_t)):02d})"
+        )
+        print(
+            f"    max  : {max(successful_t)}  "
+            f"(chunk {t_used.index(max(successful_t)):02d})"
+        )
+        print(f"    mean : {sum(successful_t)/len(successful_t):.2f}")
+
+    print()
+    print(
+        f"  k_used: min={min(k_used)}  max={max(k_used)}  "
+        f"mean={sum(k_used)/len(k_used):.2f}"
+    )
+
+    if failed_t:
+        print(
+            f"\n  FAILED BCH chunks (nerr = -1)  <- errors exceeded t={t}:"
+        )
+        for ci in failed_t:
+            print(f"    chunk {ci:02d}: k_used={k_used[ci]} > t={t}")
+    else:
+        print(f"\n  All {num_chunks} BCH chunks decoded successfully ✓")
+        if all_gates_pass:
+            print(f"  HMAC verified ✓  ->  genuine identity confirmed.")
+
+    # ── Impostor diagnostic ───────────────────────────────────────────────────
+    if not gate1_pass or not gate2_pass:
+        print()
+        print(
+            f"  ── IMPOSTOR DIAGNOSTIC ─────────────────────────────────────"
+        )
+        print(
+            f"  BCH corrected {total_corr} errors across {num_chunks} chunks."
+        )
+        print(f"  Mean errors/chunk : {sum(k_used)/len(k_used):.2f}")
+        print(
+            f"  HMAC gate 3 result: "
+            f"{'MATCH (BCH miscorrected to genuine secret!)' if bch_hmac_match else 'MISMATCH (secure ✓)'}"
+        )
+        if bch_hmac_match and not all_gates_pass:
+            print(
+                f"  -> Impostor errors (~{sum(k_used)//num_chunks}/chunk) < t={t}"
+            )
+            print(f"  -> BCH decoded impostor bits to V1's exact secret r")
+            print(
+                f"  -> HMAC matched — but cosine {cos_sim:.4f} proves DIFFERENT PERSON"
+            )
+            print(
+                f"  -> Identity gates (G1+G2) BLOCKED this false accept ✓"
+            )
+        print(
+            f"  ────────────────────────────────────────────────────────────"
+        )
+
+    print("  " + sep60)
+    print(sep60)
+
+    return {
+        "label"          : video_label,
+        "hamming_total"  : total_ham,
+        "hamming_rate"   : ham_rate,
+        "max_chunk"      : max_chunk_ham,
+        "chunks_over_t"  : chunks_over_t,
+        "bch_failed"     : bch_failed_count,
+        "corrected"      : total_corr,
+        "remaining"      : remaining,
+        "bch_hmac_match" : bch_hmac_match,
+        "gate1_pass"     : gate1_pass,
+        "gate2_pass"     : gate2_pass,
+        "gate3_pass"     : gate3_pass,
+        "all_gates_pass" : all_gates_pass,
+        "cos_sim"        : cos_sim,
+        "t_used"         : t_used,
+        "k_used"         : k_used,
+        "t_min"          : min(successful_t) if successful_t else None,
+        "t_max"          : max(successful_t) if successful_t else None,
+        "k_min"          : min(k_used),
+        "k_max"          : max(k_used),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 9 — MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run():
+    sep70 = "=" * 70
+
+    # ── Build BCH generator — ALL derived values come from here ───────────────
+    log.info(
+        f"Building BCH(N={BCH_N}, t={BCH_T_DESIGNED}) generator polynomial ..."
+    )
+    g, BCH_K, BCH_PAR = build_bch_generator(BCH_T_DESIGNED, BCH_N)
+
+    # ── All downstream parameters derived — nothing hardcoded below ───────────
+    PAYLOAD_BITS = EMBEDDING_DIM * QUANT_BITS        # e.g. 512 × 4 = 2048
+    NUM_CHUNKS   = math.ceil(PAYLOAD_BITS / BCH_K)   # e.g. ceil(2048 / 71) = 29
+    T_TOTAL      = NUM_CHUNKS * BCH_T_DESIGNED        # e.g. 29 × 28 = 812
+    PAD_NEEDED   = NUM_CHUNKS * BCH_K - PAYLOAD_BITS  # e.g. 29×71 − 2048 = 11
+
+    print(sep70)
+    print(
+        "  ADAFACE + BCH FUZZY COMMITMENT — Phase 12 (Cryptographically Correct)"
+    )
+    print(sep70)
+    print()
+    print(
+        "  PARAMETER DERIVATION "
+        "(all values computed from BCH_T_DESIGNED and QUANT_BITS):"
+    )
+    print(f"    BCH_T_DESIGNED = {BCH_T_DESIGNED}")
+    print(f"    QUANT_BITS     = {QUANT_BITS}")
+    print(f"    EMBEDDING_DIM  = {EMBEDDING_DIM}")
+    print(f"    BCH_N          = {BCH_N}")
+    print()
+    print(
+        f"    build_bch_generator({BCH_T_DESIGNED})"
+        f" → K={BCH_K}, PAR={BCH_PAR}"
+    )
+    print(
+        f"    PAYLOAD_BITS   = {EMBEDDING_DIM} × {QUANT_BITS}"
+        f" = {PAYLOAD_BITS} bits"
+    )
+    print(
+        f"    NUM_CHUNKS     = ceil({PAYLOAD_BITS} / {BCH_K})"
+        f" = {NUM_CHUNKS}"
+    )
+    print(
+        f"    PAD_NEEDED     = {NUM_CHUNKS} × {BCH_K} − {PAYLOAD_BITS}"
+        f" = {PAD_NEEDED} bits"
+    )
+    print(
+        f"    T_TOTAL        = {NUM_CHUNKS} × {BCH_T_DESIGNED}"
+        f" = {T_TOTAL}"
+    )
+    print(
+        f"    HELPER SIZE    = {NUM_CHUNKS} × {BCH_N}"
+        f" = {NUM_CHUNKS * BCH_N} bits"
+    )
+    print()
+    print("  CRYPTOGRAPHIC DESIGN:")
+    print()
+    print("  ENROLL:")
+    print(
+        f"    r[i]      = V1_chunk[i]"
+        f"                     (K={BCH_K}-bit secret)"
+    )
+    print(
+        f"    cw_r[i]   = BCH_encode(r[i])"
+        f"                (N={BCH_N}-bit codeword)"
+    )
+    print(
+        f"    helper[i] = cw_r[i] XOR (r[i]++zeros({BCH_PAR}))"
+        f"   (XOR sketch)"
+    )
+    print(
+        f"    SALT      = os.urandom(32)"
+        f"                  [random 256-bit salt]"
+    )
+    print(
+        f"    commit    = HMAC-SHA256(SALT, r[0]||…||r[N])"
+        f"  [not plain SHA-256]"
+    )
+    print()
+    print("  VERIFY:")
+    print(
+        f"    noisy[i]       = helper[i] XOR (Vx_chunk[i]++zeros({BCH_PAR}))"
+    )
+    print(f"    r_hat[i], nerr = BCH_decode(noisy[i])")
+    print(
+        f"    if any nerr == -1  →  Gate 3 FAIL  (chunk uncorrectable)"
+    )
+    print(
+        f"    commit_v       = HMAC-SHA256(SALT, r_hat[0]||…||r_hat[N])"
+    )
+    print(
+        f"    Gate 3         = (all_nerr >= 0) AND (commit_v == commit)"
+    )
+    print()
+    print("  SECURITY MODEL FOR THIS DATASET:")
+    print(
+        f"    Genuine/impostor per-chunk error distributions may overlap."
+    )
+    print(f"    Three gates are required:")
+    print(
+        f"    Gate 1: cosine >= {COSINE_ACCEPT_THRESHOLD}"
+        f"   [identity gate — PRIMARY discriminator]"
+    )
+    print(
+        f"    Gate 2: Hamming <= {HAMMING_REJECT_RATE*100:.0f}%"
+        f"   [error-rate gate — SECONDARY discriminator]"
+    )
+    print(
+        f"    Gate 3: BCH+HMAC"
+        f"     [error correction + cryptographic commitment]"
+    )
+    print()
+    print(
+        f"  BCH PARAMETERS (runtime-computed from BCH_T_DESIGNED={BCH_T_DESIGNED}):"
+    )
+    print(
+        f"    BCH(N={BCH_N}, K={BCH_K}, t={BCH_T_DESIGNED})"
+        f"   PAR={BCH_PAR}"
+    )
+    print(
+        f"    Payload  : {PAYLOAD_BITS} bits"
+        f"  ({EMBEDDING_DIM} dims × {QUANT_BITS} bits/dim)"
+    )
+    print(
+        f"    Chunks   : {NUM_CHUNKS}"
+        f"  (zero-padded last chunk: {PAD_NEEDED} bits)"
+    )
+    print(
+        f"    t_total  : {T_TOTAL}"
+        f"  ({NUM_CHUNKS} chunks × t={BCH_T_DESIGNED})"
+    )
+    print(
+        f"    Helper   : {NUM_CHUNKS} × {BCH_N}"
+        f" = {NUM_CHUNKS * BCH_N} bits stored"
+    )
+    print(sep70)
+
+    if not Path(WEIGHTS_PATH).exists():
+        raise FileNotFoundError(f"Model not found: {WEIGHTS_PATH}")
+    for vp in VIDEO_PATHS:
+        if not Path(vp).exists():
+            raise FileNotFoundError(f"Video not found: {vp}")
+
+    model    = AdaFaceModel(WEIGHTS_PATH)
+    detector = FaceDetector()
+
+    embeddings: Dict[str, np.ndarray] = {}
+    for idx, vp in enumerate(VIDEO_PATHS, start=1):
+        result = process_video(vp, idx, model, detector)
+        if result:
+            name, emb = result
+            embeddings[name] = emb
+
+    print(f"\n{sep70}")
+    print("  PROCESSING COMPLETE — FINAL EMBEDDING NORMS")
+    print(sep70)
+    for name, emb in embeddings.items():
+        print(f"  {name:10}: norm = {np.linalg.norm(emb):.8f}")
+    print(f"\n  Photos saved to: {Path(OUTPUT_ROOT).resolve()}/")
+    print(sep70)
+
+    similarities: Dict[str, float] = {}
+    if len(embeddings) >= 2:
+        similarities = compute_pairwise_similarities(embeddings)
+        if similarities:
+            sv = list(similarities.values())
+            print(f"\n  Average similarity : {np.mean(sv):.8f}")
+            print(f"  Range              : {min(sv):.8f} – {max(sv):.8f}")
+
+    if "video_1" not in embeddings:
+        print(
+            f"\n{sep70}\n  ERROR: video_1 unavailable — cannot enroll.\n{sep70}"
+        )
+        return embeddings, similarities
+
+    print(f"\n{'='*70}")
+    print("  PHASE 12 — BCH FUZZY COMMITMENT (THREE-GATE, HMAC-SHA256)")
+    print("  ENROLL V1 / VERIFY V2, V3, V4, V5")
+    print("  EXPECTED: V2 PASS  V3 PASS  V4 PASS  V5 FAIL")
+    print(f"{'='*70}")
+    print(
+        f"  BCH(N={BCH_N}, K={BCH_K}, t={BCH_T_DESIGNED})"
+        f" × {NUM_CHUNKS} chunks"
+        f"  |  QUANT_BITS={QUANT_BITS}  |  t_total={T_TOTAL}"
+    )
+    print(f"  Scale: V1's [v_min, v_max] fixed reference for ALL videos")
+
+    # Quantise V1 and capture its scale
+    v1_bits, _, v1_min, v1_max = embedding_to_payload(embeddings["video_1"])
+    log.info(
+        f"V1 quantised — scale [{v1_min:.5f}, {v1_max:.5f}]"
+        f"  |  payload = {len(v1_bits)} bits"
+    )
+
+    print(f"\n{'─'*60}")
+    print("  ENROLLMENT — V1 (IOS Beard)")
+    print(f"{'─'*60}")
+
+    helper_data, commit_H1, enrollment_salt = bch_enroll(
+        v1_payload_bits=v1_bits,
+        g=g, K=BCH_K, PAR=BCH_PAR,
+        num_chunks=NUM_CHUNKS,
+    )
+
+    helper_hex = bits_to_hex([b for hd in helper_data for b in hd])
+    print(f"  Payload bits         : {len(v1_bits)}")
+    print(f"  Chunks enrolled      : {NUM_CHUNKS}")
+    print(
+        f"  Helper size          : {NUM_CHUNKS} × {BCH_N}"
+        f" = {NUM_CHUNKS * BCH_N} bits"
+    )
+    print(f"  SALT (hex, 32 bytes) : {enrollment_salt.hex()}")
+    print(f"  Commit (HMAC-SHA256) : {commit_H1}")
+    print(f"  Helper (first 64 hex): {helper_hex[:64]}...")
+    print(f"  V1 scale             : [{v1_min:.6f}, {v1_max:.6f}]")
+    print(f"{'─'*60}")
+
+    video_labels = {
+        "video_2": "IOS No Beard     (V2)",
+        "video_3": "Android Beard    (V3)",
+        "video_4": "Android No Beard (V4)",
+        "video_5": "Android Video 5  (V5)",
+    }
+    summary = []
+
+    for vid in ["video_2", "video_3", "video_4", "video_5"]:
+        if vid not in embeddings:
+            log.error(f"{vid} not available — skipping.")
+            continue
+
+        label = video_labels[vid]
+        print(f"\n{'─'*60}")
+        print(f"  VERIFICATION — {label}")
+        print(f"{'─'*60}")
+
+        vx_bits, _, _, _ = embedding_to_payload(
+            embeddings[vid], shared_min=v1_min, shared_max=v1_max
+        )
+        log.info(
+            f"{vid} quantised using V1 scale — payload = {len(vx_bits)} bits"
+        )
+
+        result = bch_verify(
+            vx_payload_bits=vx_bits,
+            v1_payload_bits=v1_bits,
+            v1_embedding   =embeddings["video_1"],
+            vx_embedding   =embeddings[vid],
+            helper_data    =helper_data,
+            commit_enroll  =commit_H1,
+            salt           =enrollment_salt,
+            g=g, K=BCH_K, PAR=BCH_PAR, t=BCH_T_DESIGNED,
+            num_chunks     =NUM_CHUNKS,
+            video_label    =vid,
+        )
+        summary.append(result)
+
+    # ── Final summary table ───────────────────────────────────────────────────
+    print(f"\n{'='*70}")
+    print("  PHASE 12 — FINAL SUMMARY")
+    print(f"{'='*70}")
+    print(f"  Enrolled    : V1 — IOS Beard")
+    print(f"  SALT        : {enrollment_salt.hex()[:32]}...")
+    print(f"  Commit H1   : {commit_H1}")
+    print(
+        f"  BCH params  : BCH(N={BCH_N}, K={BCH_K}, t={BCH_T_DESIGNED})"
+        f" × {NUM_CHUNKS} chunks  |  t_total={T_TOTAL}"
+    )
+    print(
+        f"  Gates       : G1=cosine>={COSINE_ACCEPT_THRESHOLD}"
+        f"  |  G2=Hamming<={HAMMING_REJECT_RATE*100:.0f}%"
+        f"  |  G3=BCH(allchunks)+HMAC-SHA256"
+    )
+    print()
+    print(
+        f"  {'Video':<24}  {'Cosine':>7}  {'G1':>4}  {'Ham%':>5}  {'G2':>4}"
+        f"  {'BCHfail':>7}  {'HMAC':>5}  {'G3':>4}  {'RESULT':>6}  Note"
+    )
+    print(
+        f"  {'─'*24}  {'─'*7}  {'─'*4}  {'─'*5}  {'─'*4}"
+        f"  {'─'*7}  {'─'*5}  {'─'*4}  {'─'*6}  {'─'*32}"
+    )
+
+    for r in summary:
+        g1s   = "PASS" if r["gate1_pass"] else "FAIL"
+        g2s   = "PASS" if r["gate2_pass"] else "FAIL"
+        g3s   = "PASS" if r["gate3_pass"] else "FAIL"
+        hmacs = "MATCH" if r["bch_hmac_match"] else "MISS"
+        ress  = "PASS ✓" if r["all_gates_pass"] else "FAIL ✗"
+        hams  = f"{r['hamming_rate']*100:.1f}%"
+        bchfs = str(r["bch_failed"])
+
+        if r["all_gates_pass"]:
+            note = "genuine: BCH corrected, HMAC verified ✓"
+        elif r["bch_failed"] > 0:
+            note = f"BCH {r['bch_failed']} chunks exceeded t={BCH_T_DESIGNED}"
+        elif r["bch_hmac_match"] and not r["all_gates_pass"]:
+            note = "BCH miscorrected -> identity gates blocked"
+        else:
+            note = "impostor: identity gates rejected ✓"
+
+        print(
+            f"  {r['label']:<24}  "
+            f"{r['cos_sim']:>7.4f}  "
+            f"{g1s:>4}  {hams:>5}  {g2s:>4}  "
+            f"{bchfs:>7}  {hmacs:>5}  {g3s:>4}  {ress:>6}  {note}"
+        )
+
+    # ── T / K statistics ──────────────────────────────────────────────────────
+    print()
+    print(f"  {'='*68}")
+    print("  T AND K USAGE — ALL VIDEOS")
+    print(f"  {'='*68}")
+    print(
+        f"  BCH(N={BCH_N}, K={BCH_K}, t={BCH_T_DESIGNED})"
+        f"  PAR={BCH_PAR}"
+    )
+    print(
+        f"  QUANT_BITS={QUANT_BITS}  PAYLOAD={PAYLOAD_BITS}"
+        f"  CHUNKS={NUM_CHUNKS}  T_TOTAL={T_TOTAL}"
+    )
+    print()
+    print(
+        f"  {'Video':<24}  {'k_min':>5}  {'k_max':>5}  {'k_mean':>6}"
+        f"  {'t_min':>5}  {'t_max':>5}  {'t_mean':>6}  {'BCHfail':>7}  Identity"
+    )
+    print(
+        f"  {'─'*24}  {'─'*5}  {'─'*5}  {'─'*6}"
+        f"  {'─'*5}  {'─'*5}  {'─'*6}  {'─'*7}  {'─'*12}"
+    )
+
+    all_k = []; all_t = []
+    for r in summary:
+        k_vals   = r["k_used"]
+        t_vals   = [v for v in r["t_used"] if v >= 0]
+        all_k.extend(k_vals)
+        all_t.extend(t_vals)
+        identity = "GENUINE ✓" if r["all_gates_pass"] else "IMPOSTOR ✗"
+        t_min_s  = f"{min(t_vals):>5}" if t_vals else "  N/A"
+        t_max_s  = f"{max(t_vals):>5}" if t_vals else "  N/A"
+        t_mea_s  = f"{sum(t_vals)/len(t_vals):>6.2f}" if t_vals else "   N/A"
+        print(
+            f"  {r['label']:<24}  "
+            f"{min(k_vals):>5}  {max(k_vals):>5}  "
+            f"{sum(k_vals)/len(k_vals):>6.2f}  "
+            f"{t_min_s}  {t_max_s}  {t_mea_s}  "
+            f"{r['bch_failed']:>7}  {identity}"
+        )
+
+    if all_k:
+        print(
+            f"  {'─'*24}  {'─'*5}  {'─'*5}  {'─'*6}"
+            f"  {'─'*5}  {'─'*5}  {'─'*6}  {'─'*7}"
+        )
+        t_min_s      = f"{min(all_t):>5}" if all_t else "  N/A"
+        t_max_s      = f"{max(all_t):>5}" if all_t else "  N/A"
+        t_mea_s      = f"{sum(all_t)/len(all_t):>6.2f}" if all_t else "   N/A"
+        all_bch_fail = sum(r["bch_failed"] for r in summary)
+        print(
+            f"  {'OVERALL':<24}  "
+            f"{min(all_k):>5}  {max(all_k):>5}  "
+            f"{sum(all_k)/len(all_k):>6.2f}  "
+            f"{t_min_s}  {t_max_s}  {t_mea_s}  "
+            f"{all_bch_fail:>7}"
+        )
+
+    print()
+    print("  COLUMN GUIDE")
+    print(
+        f"  k_min/k_max/k_mean : per-chunk payload Hamming"
+        f" (K={BCH_K} bits/chunk)"
+    )
+    print(
+        f"  t_min/t_max/t_mean : errors corrected by BCH"
+        f" (successful chunks only)"
+    )
+    print(
+        f"  BCHfail            : chunks where errors > t={BCH_T_DESIGNED}"
+        f" (nerr = -1)"
+    )
+    print(
+        f"  Identity           : GENUINE = all 3 gates PASS"
+        f"  |  IMPOSTOR = any FAIL"
+    )
+    print(f"  {'='*68}")
+
+    # ── Outcome summary ───────────────────────────────────────────────────────
+    print()
+    genuine_pass  = [r for r in summary if r["all_gates_pass"]]
+    impostors_rej = [r for r in summary if not r["all_gates_pass"]]
+
+    print("  OUTCOME:")
+    for r in genuine_pass:
+        print(
+            f"    PASS ✓ : {r['label']}"
+            f"  (cosine={r['cos_sim']:.4f},"
+            f" Ham={r['hamming_rate']*100:.1f}%,"
+            f" BCHfail=0,"
+            f" remaining_errors={r['remaining']},"
+            f" HMAC=MATCH)"
+        )
+    for r in impostors_rej:
+        gf = []
+        if not r["gate1_pass"]:
+            gf.append(f"G1 cosine={r['cos_sim']:.4f}")
+        if not r["gate2_pass"]:
+            gf.append(f"G2 Ham={r['hamming_rate']*100:.1f}%")
+        if not r["gate3_pass"]:
+            if r["bch_failed"] > 0:
+                gf.append(f"G3 BCHfail={r['bch_failed']}")
+            else:
+                gf.append("G3 HMAC-MISS")
+        bch_note = ""
+        if r["bch_hmac_match"] and not r["all_gates_pass"]:
+            bch_note = (
+                " [BCH miscorrected to genuine secret"
+                " — identity gates blocked false accept ✓]"
+            )
+        print(f"    FAIL ✗ : {r['label']}  ({', '.join(gf)}){bch_note}")
+
+    print()
+    print("  CRYPTOGRAPHIC CORRECTNESS:")
+    print(
+        f"    Commitment : HMAC-SHA256 with random 256-bit salt"
+        f" (not plain SHA-256)"
+    )
+    print(
+        f"    BCH sketch : Juels-Wattenberg"
+        f"  helper[i] = BCH_encode(r) XOR pad"
+    )
+    print(
+        f"    t={BCH_T_DESIGNED}, K={BCH_K}:"
+        f" genuine per-chunk errors must stay < t={BCH_T_DESIGNED}"
+    )
+    print(
+        f"    Security   : Gates 1+2 are the PRIMARY identity discriminators"
+    )
+    print(
+        f"    BCH role   : error correction for genuine session variation only"
+    )
+    print(
+        f"    Parameters : QUANT_BITS={QUANT_BITS}"
+        f" | BCH(N={BCH_N}, K={BCH_K}, t={BCH_T_DESIGNED})"
+    )
+    print(
+        f"                 Chunks={NUM_CHUNKS}"
+        f" | PAD={PAD_NEEDED} bits | t_total={T_TOTAL}"
+    )
+    print(f"{'='*70}")
+
+    return embeddings, similarities
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    print("\n" + "=" * 70)
+    print("  ADAFACE + BCH FUZZY COMMITMENT — Phase 12")
+    print("  Cryptographically Correct  |  HMAC-SHA256  |  Three-Gate")
+    print(
+        f"  QUANT_BITS={QUANT_BITS}"
+        f"  |  BCH(N={BCH_N}, t={BCH_T_DESIGNED})"
+        f" → K & chunks derived at runtime"
+    )
+    print("  EXPECTED OUTCOME:  V2 PASS  V3 PASS  V4 PASS  V5 FAIL")
+    print("=" * 70)
+
+    embeddings, pairwise_sims = run()
+
+    print("\n" + "=" * 70)
+    print("  PIPELINE EXECUTION COMPLETE")
+    print("=" * 70)
+    print(f"  Videos processed  : {len(embeddings)} / {len(VIDEO_PATHS)}")
+    print(f"  Pairs compared    : {len(pairwise_sims)}")
+
+    if pairwise_sims:
+        sv = list(pairwise_sims.values())
+        print(f"  Average similarity: {np.mean(sv):.8f}")
+        print(f"  Similarity range  : {min(sv):.8f} – {max(sv):.8f}")
+        low = [s for s in sv if s < MIN_SIMILARITY_THRESHOLD]
+        if not low:
+            print("  OVERALL: GOOD — all similarities within expected range")
+        elif len(low) <= len(sv) // 3:
+            print("  OVERALL: FAIR — some LOW pairs (impostor pairs expected)")
+        else:
+            print(
+                "  OVERALL: MIXED — genuine pairs GOOD,"
+                " impostor pairs LOW as expected"
+            )
+
+    print("=" * 70)
