@@ -554,7 +554,7 @@ def main():
     print(f"  Genuine  max BER  : {genuine_max_ber:.2f}%")
     print(f"  Impostor min BER  : {impostor_min_ber:.2f}%")
     print(f"  Separation gap    : {gap:+.2f}%  "
-          f"{'CLEAN ✓' if gap > 0 else 'OVERLAP ✗'}")
+          f"{'CLEAN ' if gap > 0 else 'OVERLAP '}")
 
     if gap > 0:
         bch_t_percent = (genuine_max_ber + impostor_min_ber) / 2.0
