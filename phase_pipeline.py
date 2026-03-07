@@ -41,9 +41,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+
 #  CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
 
 VIDEO_PATHS = [
     "/home/victor/Documents/Desktop/Embeddings/IOS.mov",                          # V1
@@ -86,9 +85,7 @@ REFERENCE_PTS = np.array([
 ], dtype=np.float32)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 #  SECTION 1 — FACE ALIGNER
-# ─────────────────────────────────────────────────────────────────────────────
 
 class FaceAligner:
     def __init__(self):
@@ -196,9 +193,7 @@ class FaceAligner:
                               borderMode=cv2.BORDER_REFLECT)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 #  SECTION 2 — ADAFACE MODEL
-# ─────────────────────────────────────────────────────────────────────────────
 
 class AdaFaceModel:
     def __init__(self, model_path: str):
@@ -224,9 +219,7 @@ class AdaFaceModel:
         return emb.astype(np.float32)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 #  SECTION 3 — FRAME EXTRACTION
-# ─────────────────────────────────────────────────────────────────────────────
 
 def extract_frames(video_path: str) -> List[np.ndarray]:
     cap = cv2.VideoCapture(video_path)
@@ -252,10 +245,7 @@ def extract_frames(video_path: str) -> List[np.ndarray]:
     top.sort(key=lambda x: x[1])
     return [f for _, _, f in top]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  SECTION 4 — EMBED ONE VIDEO → UNIT EMBEDDING
-# ─────────────────────────────────────────────────────────────────────────────
 
 def embed_video(
     video_path : str,
@@ -335,9 +325,7 @@ def ber(bits_a: np.ndarray, bits_b: np.ndarray) -> Tuple[int, float]:
     return errors, rate
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 #  HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
 
 def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     a = a / (np.linalg.norm(a) + 1e-10)
@@ -349,9 +337,7 @@ SEP  = "=" * 62
 SEP2 = "─" * 62
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 #  MAIN
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     if not Path(WEIGHTS_PATH).exists():
@@ -392,9 +378,9 @@ def main():
             nb  = VIDEO_NAMES.get(kb, kb)
             print(f"  {na + ' vs ' + nb:<35}  {sim:>10.4f}")
 
-    # ══════════════════════════════════════════════════════════════════════════
+    
     #  PHASE 1 — BUILD MASTER V
-    # ══════════════════════════════════════════════════════════════════════════
+   
     print(f"\n{SEP}")
     print("  PHASE 1 — BUILD MASTER V")
     print(SEP)
@@ -422,9 +408,9 @@ def main():
         sim = cosine_sim(embeddings[k], master_v)
         print(f"    {VIDEO_NAMES[k]:<20}  →  {sim:.4f}")
 
-    # ══════════════════════════════════════════════════════════════════════════
+
     #  PHASE 2 — QUANTISE V1, V2, V3, V4, MASTER V  (4-bit)
-    # ══════════════════════════════════════════════════════════════════════════
+  
     print(f"\n{SEP}")
     print("  PHASE 2 — QUANTISE GENUINE EMBEDDINGS + MASTER V  (4-bit)")
     print(SEP)
@@ -451,16 +437,15 @@ def main():
     b_master = to_bits(q_master)
     print(f"  {'Master V':<20}  q[:8]={q_master[:8].tolist()}  bits[:16]={b_master[:16].tolist()}")
 
-    # ══════════════════════════════════════════════════════════════════════════
     #  PHASE 3 — BER TESTS  (genuine)
-    # ══════════════════════════════════════════════════════════════════════════
+
     print(f"\n{SEP}")
     print("  PHASE 3 — BER TESTS  (GENUINE)")
     print(SEP)
     print(f"  BER = Bit Error Rate over {512*QUANT_BITS} bits ({512} dims × {QUANT_BITS} bits)")
     print(f"  Expected: LOW BER for same-person pairs")
 
-    # ── Test 1: V1,V2,V3,V4 vs each other ────────────────────────────────────
+    # ── Test 1: V1,V2,V3,V4 vs each other 
     print(f"\n  TEST 1 — Genuine pairs  (V1,V2,V3,V4 vs each other)")
     print(f"  {SEP2}")
     print(f"  {'Pair':<35}  {'Errors':>7}  {'BER %':>7}  {'CosSim':>8}")
@@ -481,7 +466,7 @@ def main():
           f"max BER={max(t1_bers):.2f}%  "
           f"mean BER={np.mean(t1_bers):.2f}%")
 
-    # ── Test 2: V1,V2,V3,V4 each vs Master V ─────────────────────────────────
+    #  Test 2: V1,V2,V3,V4 each vs Master V
     print(f"\n  TEST 2 — Genuine videos vs Master V")
     print(f"  {SEP2}")
     print(f"  {'Pair':<35}  {'Errors':>7}  {'BER %':>7}  {'CosSim':>8}")
@@ -500,9 +485,7 @@ def main():
           f"max BER={max(t2_bers):.2f}%  "
           f"mean BER={np.mean(t2_bers):.2f}%")
 
-    # ══════════════════════════════════════════════════════════════════════════
     #  PHASE 4 — QUANTISE V5, V6, V7  (4-bit)
-    # ══════════════════════════════════════════════════════════════════════════
     print(f"\n{SEP}")
     print("  PHASE 4 — QUANTISE IMPOSTOR EMBEDDINGS  (4-bit)")
     print(SEP)
@@ -523,9 +506,8 @@ def main():
         name = VIDEO_NAMES[k]
         print(f"  {name:<20}  q[:8]={q[:8].tolist()}  bits[:16]={b[:16].tolist()}")
 
-    # ══════════════════════════════════════════════════════════════════════════
     #  PHASE 5 — FAR TEST  (V5,V6,V7 vs Master V)
-    # ══════════════════════════════════════════════════════════════════════════
+
     print(f"\n{SEP}")
     print("  PHASE 5 — FAR TEST  (IMPOSTOR vs MASTER V)")
     print(SEP)
@@ -547,9 +529,7 @@ def main():
           f"max BER={max(t5_bers):.2f}%  "
           f"mean BER={np.mean(t5_bers):.2f}%")
 
-    # ══════════════════════════════════════════════════════════════════════════
     #  FINAL SUMMARY
-    # ══════════════════════════════════════════════════════════════════════════
     print(f"\n{SEP}")
     print("  FINAL SUMMARY")
     print(SEP)
