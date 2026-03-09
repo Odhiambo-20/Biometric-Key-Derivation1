@@ -1,6 +1,6 @@
 """
-AdaFace BCH Fuzzy Commitment Pipeline  — FACE-DERIVED KEY
-==========================================================
+AdaFace BCH Fuzzy Commitment Pipeline
+======================================
 
 Embedding pipeline per video:
   1. Extract top-20 sharpest frames (scan 60 candidates)
@@ -8,7 +8,7 @@ Embedding pipeline per video:
   3. AdaFace IR-18 → raw 512-dim embedding
   4. L2 normalise → unit vector
   5. Average all frame unit vectors → L2 renormalise → final unit embedding
-  6. Scale × K (sweep K=1,2,3,4 → pick lowest genuine BER)
+  6. Scale × K  (sweep K=1,2,3,4 → pick lowest genuine BER, or force via FORCE_SCALE)
   7. Clip [-1, +1]
   8. Quantise uniform 4-bit → integers [0,15]
   9. Gray-code encode each integer
@@ -17,29 +17,18 @@ Embedding pipeline per video:
 BCH parameters: n=255, k=71, t=28, num_chunks=8
   → 2040 bits per embedding, 568-bit key
 
-KEY DERIVATION (face-derived, not random):
-  key = SHA256(bitvec) truncated to NUM_CHUNKS × BCH_K bits
-  This ensures the same face always produces the same key deterministically.
-  V1, V2, V3, V4 belong to the same person → they should all recover each
-  other's keys (because the keys are tied to the face bitvec, which is
-  similar enough for BCH to correct).
+KEY SCHEME: ONE shared random key K locked into helper data per enrollment.
+  helper_Vi = bitvec_Vi  XOR  BCH_encode(K)
+  All four genuine videos (V1-V4) lock the SAME key K.
+  Genuine probes recover K exactly → hash matches.
+  Impostor probes exceed t=28 errors/chunk → BCH fails → hash mismatch.
 
-  IMPORTANT: V1's key ≠ V2's key (their bitvecs differ slightly), but:
-    - V2 can RECOVER V1's key using V1's helper data  (BCH corrects the noise)
-    - V1 can RECOVER V2's key using V2's helper data
-    - V5/V6/V7 CANNOT recover any genuine key (too many bit errors)
-
-Phase 1 : Enroll V1, V2, V3, V4 independently
-          key      = SHA256(bitvec)[:568 bits]   ← deterministic, face-derived
-          helper   = bitvec XOR BCH_encode(key)
-
-Phase 2 :
-  Test 1 — V1 helper data → recover V1's key from V2,V3,V4 (genuine) and V5,V6,V7 (impostor)
-  Test 2 — V2 helper data → recover V2's key from V1,V3,V4 (genuine) and V5,V6,V7 (impostor)
-  Test 3 — V3 helper data → recover V3's key from V1,V2,V4 (genuine) and V5,V6,V7 (impostor)
-
-  Genuine probes (same person) → BCH corrects noise → recovered key matches enrolled key hash ✓
-  Impostor probes (diff person) → too many errors → BCH fails → key NOT recovered ✗
+SCALE CONTROL (see CONFIG section below):
+  FORCE_SCALE = None   → auto-select best K from sweep (recommended)
+  FORCE_SCALE = 1      → force K=1
+  FORCE_SCALE = 2      → force K=2  (use this to compare with auto-selected K=1)
+  FORCE_SCALE = 3      → force K=3
+  FORCE_SCALE = 4      → force K=4
 """
 
 import hashlib
@@ -97,7 +86,19 @@ BCH_N        = 255
 BCH_K        = 71
 BCH_T        = 28
 NUM_CHUNKS   = 8
-SCALE_VALUES = [1, 2, 3, 4]
+SCALE_VALUES = [1, 2, 3, 4]   # Always sweep all — FORCE_SCALE overrides winner
+
+# ── SCALE CONTROL ──────────────────────────────────────────────────────────
+# Set FORCE_SCALE to an integer to skip auto-selection and use that scale.
+# Set to None to let the sweep automatically pick the best (lowest genuine BER).
+#
+#   FORCE_SCALE = None  → auto-select  (default / recommended)
+#   FORCE_SCALE = 1     → force K=1
+#   FORCE_SCALE = 2     → force K=2   ← set this to compare against K=1
+#   FORCE_SCALE = 3     → force K=3
+#   FORCE_SCALE = 4     → force K=4
+# ───────────────────────────────────────────────────────────────────────────
+FORCE_SCALE = 2    # ← change to None to restore auto-select
 
 REFERENCE_PTS = np.array([
     [38.2946, 51.6963],
@@ -590,22 +591,50 @@ def recover(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def select_best_scale(embeddings):
-    genuine_keys=["video_1","video_2","video_3","video_4"]
-    best_scale=SCALE_VALUES[0]; best_mean=999.0
+    """
+    Always sweeps K=1,2,3,4 and shows BER for all.
+    Returns FORCE_SCALE if set, otherwise returns the auto-selected best.
+    """
+    genuine_keys = ["video_1","video_2","video_3","video_4"]
+    auto_best    = SCALE_VALUES[0]
+    best_mean    = 999.0
+
     print(f"\n  Scale sweep — raw bit-vector BER between genuine pairs (pre-BCH)")
-    print(f"  {'Scale':<8}  {'Min BER':>8}  {'Max BER':>8}  {'Mean BER':>9}")
-    print(f"  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*9}")
+    print(f"  {'Scale':<8}  {'Min BER':>8}  {'Max BER':>8}  {'Mean BER':>9}  {'Note'}")
+    print(f"  {'─'*8}  {'─'*8}  {'─'*8}  {'─'*9}  {'─'*20}")
+
+    scale_stats = {}
     for scale in SCALE_VALUES:
-        bvs={k:embedding_to_bitvec(embeddings[k],scale) for k in genuine_keys}
-        bers=[]
-        for i,ka in enumerate(genuine_keys):
+        bvs  = {k: embedding_to_bitvec(embeddings[k], scale) for k in genuine_keys}
+        bers = []
+        for i, ka in enumerate(genuine_keys):
             for kb in genuine_keys[i+1:]:
-                _,rate=ber_bits(bvs[ka],bvs[kb]); bers.append(rate)
-        mean_ber=float(np.mean(bers))
-        print(f"  K={scale:<6}  {min(bers):>7.2f}%  {max(bers):>7.2f}%  {mean_ber:>8.2f}%")
-        if mean_ber<best_mean: best_mean=mean_ber; best_scale=scale
-    print(f"\n  → Best scale: K={best_scale}  (mean genuine BER = {best_mean:.2f}%)")
-    return best_scale
+                _, rate = ber_bits(bvs[ka], bvs[kb])
+                bers.append(rate)
+        mean_ber = float(np.mean(bers))
+        scale_stats[scale] = {"min": min(bers), "max": max(bers), "mean": mean_ber}
+        if mean_ber < best_mean:
+            best_mean = mean_ber
+            auto_best = scale
+
+    for scale in SCALE_VALUES:
+        s = scale_stats[scale]
+        forced_tag = "← FORCED" if FORCE_SCALE == scale else \
+                     "← auto-best" if (FORCE_SCALE is None and scale == auto_best) else ""
+        print(f"  K={scale:<6}  {s['min']:>7.2f}%  {s['max']:>7.2f}%  {s['mean']:>8.2f}%  {forced_tag}")
+
+    if FORCE_SCALE is not None:
+        if FORCE_SCALE not in SCALE_VALUES:
+            raise ValueError(f"FORCE_SCALE={FORCE_SCALE} not in SCALE_VALUES={SCALE_VALUES}")
+        chosen = FORCE_SCALE
+        print(f"\n  → Using scale: K={chosen}  [FORCED]  "
+              f"(auto-best was K={auto_best} with mean BER={scale_stats[auto_best]['mean']:.2f}%)")
+    else:
+        chosen = auto_best
+        print(f"\n  → Using scale: K={chosen}  [auto-selected]  "
+              f"(mean genuine BER = {scale_stats[chosen]['mean']:.2f}%)")
+
+    return chosen
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -623,7 +652,7 @@ def print_result_row(label, result, is_genuine):
     tmx = f"{result['t_max']:3}"
     tmn = f"{result['t_mean']:5.1f}"
     fail= result['bch_fail']
-    tag = " PASS" if result['key_match'] else " FAIL"
+    tag = "✓ PASS" if result['key_match'] else "✗ FAIL"
     who = "(genuine) " if is_genuine else "(impostor)"
     print(f"  {label:<22}  k%[{km},{kmx},{kmn}]  t[{tm},{tmx},{tmn}]  fail={fail}  {tag} {who}")
 
@@ -660,9 +689,10 @@ def main():
 
     # ── Scale selection ───────────────────────────────────────────────────────
     print(f"\n{SEP}")
-    print("  SCALE SELECTION  (K ∈ {1, 2, 3, 4})")
+    mode = f"FORCE_SCALE={FORCE_SCALE}" if FORCE_SCALE is not None else "auto-select"
+    print(f"  SCALE SELECTION  (K ∈ {{1, 2, 3, 4}})  [{mode}]")
     print(SEP)
-    best_scale=select_best_scale(embeddings)
+    best_scale = select_best_scale(embeddings)
 
     # ── Convert to bit vectors ────────────────────────────────────────────────
     print(f"\n{SEP}")
@@ -729,14 +759,15 @@ def main():
     print(f"\n{SEP}")
     print("  PHASE 2 — BCH FUZZY COMMITMENT RECOVERY")
     print(SEP)
-    print(f"  BCH({BCH_N},{BCH_K},{BCH_T})  chunks={NUM_CHUNKS}  scale=K={best_scale}")
-    print(f"  key = SHA256(enrolled_bitvec)  [face-derived]")
+    print(f"  BCH({BCH_N},{BCH_K},{BCH_T})  chunks={NUM_CHUNKS}  scale=K={best_scale}"
+          + (f"  [FORCED — auto-best was K=1]" if FORCE_SCALE is not None else "  [auto-selected]"))
+    print(f"  key = shared random K  (same for all enrollments, stored securely)")
     print(f"  k%[min,max,mean] = per-chunk key BER%  (0% = BCH succeeded all chunks)")
     print(f"  t[min,max,mean]  = bit-errors corrected per chunk  (max={BCH_T})")
     print(f"  fail             = chunks where BCH decoding failed")
     print(f"\n  Expectation:")
-    print(f"    Genuine  (V1-V4, same person) → recovered hash MATCHES enrolled hash ")
-    print(f"    Impostor (V5-V7, diff person) → BCH fails, hash MISMATCH             ")
+    print(f"    Genuine  (V1-V4, same person) → recovered hash MATCHES enrolled hash ✓")
+    print(f"    Impostor (V5-V7, diff person) → BCH fails, hash MISMATCH             ✗")
 
     header=(f"  {'Probe':<22}  {'k%[min, max,mean]':^22}  "
             f"{'t[min,max, mean]':^18}  fail  Result         Recovered hash (first 20)")
@@ -762,7 +793,7 @@ def main():
             tmx = f"{r['t_max']:3}"
             tmn = f"{r['t_mean']:5.1f}"
             fail= r['bch_fail']
-            tag = " PASS" if r['key_match'] else " FAIL"
+            tag = "✓ PASS" if r['key_match'] else "✗ FAIL"
             who = "(genuine) " if is_g else "(impostor)"
             rhash = r['recovered_hash'][:20] if r['key_match'] else r['recovered_hash'][:20]
             match_mark = "=" if r['key_match'] else "≠"
@@ -808,7 +839,7 @@ def main():
     print(f"  BCH parameters : n={BCH_N}, k={BCH_K}, t={BCH_T}, chunks={NUM_CHUNKS}")
     print(f"  Scale          : K={best_scale}")
     print(f"  Bit vector     : {NUM_CHUNKS*BCH_N} bits  ({QUANT_BITS}-bit Gray code)")
-    print(f"  Key derivation : SHA256(bitvec) — face-derived, deterministic")
+    print(f"  Key derivation : shared random K  (one key per person, used for all enrollments)")
     print(f"  Key length     : {NUM_CHUNKS*BCH_K} bits")
     print()
     print(f"  All genuine probes should recover the EXACT same hash as the enrolled key.")
@@ -825,13 +856,13 @@ def main():
     print()
 
     if total_g==total_gn and total_i==total_in:
-        print("   PERFECT SEPARATION — all genuine accepted, all impostors rejected")
-        print(f"   All genuine probes recovered the exact enrolled key hash ")
+        print("  ★ PERFECT SEPARATION — all genuine accepted, all impostors rejected")
+        print(f"  ★ All genuine probes recovered the exact enrolled key hash ✓")
     else:
         if total_g<total_gn:
-            print(f"   {total_gn-total_g} genuine pair(s) failed → per-chunk BER may exceed t={BCH_T}")
+            print(f"  ✗ {total_gn-total_g} genuine pair(s) failed → per-chunk BER may exceed t={BCH_T}")
         if total_i<total_in:
-            print(f"   {total_in-total_i} impostor(s) accepted — BCH t may be too permissive")
+            print(f"  ✗ {total_in-total_i} impostor(s) accepted — BCH t may be too permissive")
     print(SEP)
 
 
