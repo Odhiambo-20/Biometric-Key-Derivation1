@@ -261,24 +261,76 @@ def embed_video(video_path, model, aligner):
 # ─────────────────────────────────────────────────────────────────────────────
 #  EMBEDDING → BIT VECTOR
 #  unit_emb → ×scale → clip[-1,1] → 4-bit quant → Gray code → bits
+#
+#  INTERLEAVING: After generating the 2040-bit vector, bits are interleaved
+#  across all 8 chunks before BCH encoding/decoding.
+#
+#  Without interleaving, bit errors cluster in specific regions of the
+#  embedding (some dimensions differ more than others between videos).
+#  This causes certain chunks to receive 30+ errors while others get <10,
+#  causing single-chunk BCH failures even when the TOTAL error count is
+#  well within the 8×28=224 budget.
+#
+#  With interleaving, each chunk receives bits from evenly-spaced positions
+#  across the entire 2040-bit vector:
+#    chunk[i] = bits[i, i+8, i+16, i+24, ..., i+8*254]  (every 8th bit)
+#
+#  This spreads errors uniformly so each chunk gets ≈ total_errors/8,
+#  keeping per-chunk errors well below t=28.
+#
+#  De-interleaving reverses this at recovery to reconstruct the original
+#  bit vector order.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def to_gray(n): return n ^ (n >> 1)
 
+def interleave(bits: np.ndarray, num_chunks: int = NUM_CHUNKS) -> np.ndarray:
+    """
+    Interleave bits across chunks.
+    Input:  [b0, b1, b2, ..., b(N*C-1)]  length = num_chunks * BCH_N
+    Output: chunk[i] = bits at positions [i, i+C, i+2C, ..., i+(N-1)*C]
+    i.e. output[i*N + j] = input[j*C + i]
+    """
+    total = num_chunks * BCH_N
+    out   = np.empty(total, dtype=np.uint8)
+    for i in range(num_chunks):
+        out[i * BCH_N:(i + 1) * BCH_N] = bits[i::num_chunks]
+    return out
+
+def deinterleave(bits: np.ndarray, num_chunks: int = NUM_CHUNKS) -> np.ndarray:
+    """
+    Reverse of interleave.
+    output[j*C + i] = input[i*N + j]
+    """
+    total = num_chunks * BCH_N
+    out   = np.empty(total, dtype=np.uint8)
+    for i in range(num_chunks):
+        out[i::num_chunks] = bits[i * BCH_N:(i + 1) * BCH_N]
+    return out
+
 def embedding_to_bitvec(embedding, scale, bits=QUANT_BITS):
-    levels=(1<<bits)-1
-    scaled=np.clip(embedding*scale,-1.0,1.0)
-    q=np.clip(np.round((scaled+1.0)/2.0*levels).astype(np.int32),0,levels)
-    g=np.array([to_gray(int(v)) for v in q],dtype=np.int32)
-    result=np.zeros(len(g)*bits,dtype=np.uint8)
-    for i,val in enumerate(g):
+    """
+    Convert a face embedding to an interleaved 2040-bit vector.
+    Interleaving spreads errors evenly across BCH chunks.
+    """
+    levels = (1 << bits) - 1
+    scaled = np.clip(embedding * scale, -1.0, 1.0)
+    q      = np.clip(np.round((scaled + 1.0) / 2.0 * levels).astype(np.int32), 0, levels)
+    g      = np.array([to_gray(int(v)) for v in q], dtype=np.int32)
+    result = np.zeros(len(g) * bits, dtype=np.uint8)
+    for i, val in enumerate(g):
         for b in range(bits):
-            result[i*bits+(bits-1-b)]=(int(val)>>b)&1
-    return result[:NUM_CHUNKS*BCH_N]
+            result[i * bits + (bits - 1 - b)] = (int(val) >> b) & 1
+    raw    = result[:NUM_CHUNKS * BCH_N]
+    return interleave(raw)          # ← interleave before chunking
 
 def ber_bits(a, b):
-    errors=int(np.sum(a!=b))
-    return errors, errors/len(a)*100.0
+    """BER on raw (pre-interleave) bits for display purposes."""
+    # Deinterleave both before comparing so BER table shows natural embedding order
+    a_raw = deinterleave(a) if len(a) == NUM_CHUNKS * BCH_N else a
+    b_raw = deinterleave(b) if len(b) == NUM_CHUNKS * BCH_N else b
+    errors = int(np.sum(a_raw != b_raw))
+    return errors, errors / len(a_raw) * 100.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -709,16 +761,22 @@ def main():
         print(f"  {name:<20}  len={len(bv)}  ones={int(bv.sum())}  density={bv.mean():.3f}")
 
     # Pre-BCH BER
-    print(f"\n  Pre-BCH BER (raw Hamming):")
-    print(f"  {'Pair':<37}  {'Err':>5}  {'BER%':>6}  {'Per-chunk':>10}  Type")
-    print(f"  {'─'*37}  {'─'*5}  {'─'*6}  {'─'*10}  {'─'*8}")
+    print(f"\n  Pre-BCH BER (interleaved bits — as BCH sees them):")
+    print(f"  {'Pair':<37}  {'Err':>5}  {'BER%':>6}  {'Avg/chunk':>9}  {'Max/chunk':>9}  Type")
+    print(f"  {'─'*37}  {'─'*5}  {'─'*6}  {'─'*9}  {'─'*9}  {'─'*8}")
     genuine_set={"video_1","video_2","video_3","video_4"}
     for i,ka in enumerate(all_keys):
         for kb in all_keys[i+1:]:
-            errs,rate=ber_bits(bitvecs[ka],bitvecs[kb])
-            per_chunk=errs/NUM_CHUNKS
-            kind="genuine " if (ka in genuine_set and kb in genuine_set) else "impostor"
-            print(f"  {VIDEO_NAMES[ka]+' vs '+VIDEO_NAMES[kb]:<37}  {errs:>5}  {rate:>5.2f}%  {per_chunk:>8.1f}b   {kind}")
+            errs, rate = ber_bits(bitvecs[ka], bitvecs[kb])
+            chunk_errs = [int(np.sum(bitvecs[ka][c*BCH_N:(c+1)*BCH_N] !=
+                                     bitvecs[kb][c*BCH_N:(c+1)*BCH_N]))
+                          for c in range(NUM_CHUNKS)]
+            avg_chunk = errs / NUM_CHUNKS
+            max_chunk = max(chunk_errs)
+            kind = "genuine " if (ka in genuine_set and kb in genuine_set) else "impostor"
+            warn = " ⚠" if max_chunk > BCH_T else ""
+            print(f"  {VIDEO_NAMES[ka]+' vs '+VIDEO_NAMES[kb]:<37}  {errs:>5}  "
+                  f"{rate:>5.2f}%  {avg_chunk:>8.1f}b  {max_chunk:>8}b{warn}   {kind}")
 
     # ── BCH codec ────────────────────────────────────────────────────────────
     print(f"\n{SEP}")
