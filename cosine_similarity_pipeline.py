@@ -41,23 +41,25 @@ log = logging.getLogger(__name__)
 #  CONFIG
 # =============================================================================
 
-WEIGHTS_PATH = (
-    "/home/victor/Documents/Desktop/Adaface/adaface-onnx/weights/adaface_ir_18.onnx"
-)
+# Base folder — update this to match your machine if needed
+VIDEO_DIR = Path("/home/victor/Documents/Desktop/Embeddings/drive-download-20260310T203758Z-1-001")
 
+WEIGHTS_PATH = "/home/victor/Documents/Desktop/Adaface/adaface-onnx/weights/adaface_ir_18.onnx"
+
+# Each tuple: (person_id, variant, filename_inside VIDEO_DIR)
 VIDEOS = [
-    ("V8",  "makeup",    "/home/victor/Documents/Desktop/Embeddings/V8 instagram Make up.mp4"),
-    ("V8",  "no_makeup", "/home/victor/Documents/Desktop/Embeddings/V8 instagram No make up.mp4"),
-    ("V9",  "makeup",    "/home/victor/Documents/Desktop/Embeddings/V9 Instagram Make up.mp4"),
-    ("V9",  "no_makeup", "/home/victor/Documents/Desktop/Embeddings/V9 Instagram No make up.mp4"),
-    ("V10", "makeup",    "/home/victor/Documents/Desktop/Embeddings/V10 Instagram Make up.mp4"),
-    ("V10", "no_makeup", "/home/victor/Documents/Desktop/Embeddings/V10 Instagram No make up.mp4"),
-    ("V11", "makeup",    "/home/victor/Documents/Desktop/Embeddings/V11 instagram Make up.mp4"),
-    ("V11", "no_makeup", "/home/victor/Documents/Desktop/Embeddings/V11 instagram No make up.mp4"),
-    ("V12", "makeup",    "/home/victor/Documents/Desktop/Embeddings/V12 instagram Make up.mp4"),
-    ("V12", "no_makeup", "/home/victor/Documents/Desktop/Embeddings/V12 instagram No make up.mp4"),
-    ("V13", "makeup",    "/home/victor/Documents/Desktop/Embeddings/V13 instagram Make up.mp4"),
-    ("V13", "no_makeup", "/home/victor/Documents/Desktop/Embeddings/V13 instagram No make up.mp4"),
+    ("V8",  "makeup",    "V8 instagram Make up.mp4"),
+    ("V8",  "no_makeup", "V8 instagram No make up.mp4"),
+    ("V9",  "makeup",    "V9 Instagram Make up.mp4"),
+    ("V9",  "no_makeup", "V9 Instagram No make up.mp4"),
+    ("V10", "makeup",    "V10 Instagram Make up.mp4"),
+    ("V10", "no_makeup", "V10 Instagram No make up.mp4"),
+    ("V11", "makeup",    "V11 instagram Make up.mp4"),
+    ("V11", "no_makeup", "V11 instagram No make up.mp4"),
+    ("V12", "makeup",    "V12 instagram Make up.mp4"),
+    ("V12", "no_makeup", "V12 instagram No make up.mp4"),
+    ("V13", "makeup",    "V13 instagram Make up.mp4"),
+    ("V13", "no_makeup", "V13 instagram No make up.mp4"),
 ]
 
 FRAMES_TO_USE  = 20
@@ -70,7 +72,7 @@ REFERENCE_PTS = np.array([
     [73.5318, 51.6963],
     [56.0252, 71.7366],
     [41.5493, 92.3655],
-    [70.7299, 92.3655],
+    [70.7299, 92.3655]
 ], dtype=np.float32)
 
 TARGET_LUMINANCE = 130.0
@@ -184,8 +186,10 @@ class FaceAligner:
                     ex,ey,ew,eh = max(d, key=lambda d: d[2]*d[3])
                     return np.array([x+xo+ex+ew//2, y+yo+ey+eh//2], dtype=np.float32)
             return None
-        er = _eye(self.reye_cc, roi[:,:half], 0,    0) or np.array([x+0.30*w, y+0.36*h], dtype=np.float32)
-        el = _eye(self.leye_cc, roi[:,half:], half, 0) or np.array([x+0.70*w, y+0.36*h], dtype=np.float32)
+        _er = _eye(self.reye_cc, roi[:,:half], 0,    0)
+        _el = _eye(self.leye_cc, roi[:,half:], half, 0)
+        er  = _er if _er is not None else np.array([x+0.30*w, y+0.36*h], dtype=np.float32)
+        el  = _el if _el is not None else np.array([x+0.70*w, y+0.36*h], dtype=np.float32)
         if er[0] > el[0]: er, el = el, er
         lms = np.array([er, el, [x+0.50*w,y+0.60*h], [x+0.35*w,y+0.76*h], [x+0.65*w,y+0.76*h]], dtype=np.float32)
         return self._warp(frame, lms)
@@ -227,7 +231,7 @@ class AdaFaceModel:
 # =============================================================================
 
 def extract_frames(video_path):
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened(): raise RuntimeError(f"Cannot open: {video_path}")
     total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     n_scan = FRAMES_TO_USE * CANDIDATE_MULT
@@ -282,11 +286,35 @@ SEP  = "=" * 72
 SEP2 = "-" * 72
 
 def main():
+    # ── Validate paths ─────────────────────────────────────────────────────
     if not Path(WEIGHTS_PATH).exists():
         raise FileNotFoundError(f"Weights not found: {WEIGHTS_PATH}")
-    for _,_,vp in VIDEOS:
-        if not Path(vp).exists():
-            raise FileNotFoundError(f"Video not found: {vp}")
+
+    if not VIDEO_DIR.exists():
+        raise FileNotFoundError(f"Video directory not found: {VIDEO_DIR}")
+
+    # Build full paths and validate each video file exists
+    video_entries = []
+    for person, variant, filename in VIDEOS:
+        full_path = VIDEO_DIR / filename
+        if not full_path.exists():
+            # Try case-insensitive search as a helpful fallback
+            matches = list(VIDEO_DIR.glob(filename))
+            if not matches:
+                # Broader search ignoring case
+                fname_lower = filename.lower()
+                matches = [p for p in VIDEO_DIR.iterdir()
+                           if p.name.lower() == fname_lower]
+            if matches:
+                full_path = matches[0]
+                log.warning(f"Filename case mismatch — using: {full_path.name}")
+            else:
+                raise FileNotFoundError(
+                    f"Video not found: {full_path}\n"
+                    f"Files in directory:\n" +
+                    "\n".join(f"  {p.name}" for p in sorted(VIDEO_DIR.iterdir()))
+                )
+        video_entries.append((person, variant, full_path))
 
     mtcnn   = _load_mtcnn()
     model   = AdaFaceModel(WEIGHTS_PATH)
@@ -296,6 +324,7 @@ def main():
     print(f"\n{SEP}")
     print("  EXTRACTING EMBEDDINGS  (20 frames per video)")
     print(SEP)
+    print(f"  Video directory: {VIDEO_DIR}")
     print("  Detector      : MTCNN + Haar fallback")
     print("  Normalisation : gamma → LAB CLAHE → A/B neutral shift")
     print("  Per frame     : embed(norm) + embed(H-flip) → L2-norm")
@@ -305,7 +334,7 @@ def main():
     embeddings: Dict[str, np.ndarray] = {}
     labels: List[str] = []
 
-    for person, variant, vpath in VIDEOS:
+    for person, variant, vpath in video_entries:
         key   = f"{person}_{variant}"
         label = f"{person} {'MU' if variant == 'makeup' else 'NM'}"
         emb   = embed_video(vpath, model, aligner, f"{person} {variant.replace('_',' ')}")
@@ -336,7 +365,7 @@ def main():
     print(f"  {'Pair':<42}  {'Cosine Sim':>10}")
     print(f"  {'-'*42}  {'-'*10}")
 
-    persons      = ["V8", "V9", "V10", "V11", "V12", "V13"]
+    persons       = ["V8", "V9", "V10", "V11", "V12", "V13"]
     within_scores = []
     for person in persons:
         mu_emb = embeddings[f"{person}_makeup"]
